@@ -1,29 +1,3 @@
-"""
-advanced_hand_face_tracking.py
-
-Advanced real-time hand + face tracking pipeline using MediaPipe + OpenCV.
-Features:
- - Multi-hand tracking with 21 landmark extraction
- - Face mesh with 468 landmarks
- - One-Euro smoothing for landmark stabilization
- - Kalman-based smoothing for bounding boxes
- - Real-time head-pose estimation (solvePnP using face landmarks)
- - Dataset capture utilities (capture labeled hand gestures)
- - Simple gesture classifier training pipeline (RandomForest) and inference
- - Modular, production-friendly structure with CLI
-
-Usage:
- pip install mediapipe opencv-python scikit-learn joblib numpy
- python advanced_hand_face_tracking.py --source 0
-
-Notes:
- - This is an opinionated, production-oriented starting point. For best accuracy in harsh environments,
-   pair MediaPipe with a custom detector or fine-tune models on your dataset.
- - Designed to be extended: swap out classifier, add pose estimation, integrate with ROS or Unity, etc.
-
-Author: ChatGPT (Fixed)
-"""
-
 import argparse
 import time
 import os
