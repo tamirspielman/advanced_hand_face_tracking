@@ -8,6 +8,14 @@ from collections import deque
 import cv2
 import numpy as np
 
+# Import for PC control
+try:
+    import pyautogui
+    import screen_brightness_control as sbc
+except ImportError:
+    print("PC control features require pyautogui and screen_brightness_control")
+    print("Install with: pip install pyautogui screen_brightness_control")
+
 # Optional heavy deps
 try:
     import mediapipe as mp
@@ -91,6 +99,113 @@ class Kalman2D:
         return corrected[0][0], corrected[1][0]
 
 
+# ----------------------------- Gesture Recognition -----------------------------
+class GestureRecognizer:
+    def __init__(self):
+        self.last_volume_time = 0
+        self.volume_cooldown = 0.5  # seconds
+        self.last_brightness_time = 0
+        self.brightness_cooldown = 0.5
+        
+    def calculate_distance(self, point1, point2):
+        return math.sqrt((point1[0]-point2[0])**2 + (point1[1]-point2[1])**2)
+    
+    def fingers_extended(self, landmarks):
+        """Check which fingers are extended"""
+        tips = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky
+        mcp_joints = [2, 5, 9, 13, 17]  # metacarpophalangeal joints
+        
+        extended = []
+        for tip, mcp in zip(tips, mcp_joints):
+            # For thumb, use different logic
+            if tip == 4:  # thumb
+                extended.append(landmarks[tip][0] > landmarks[mcp][0])
+            else:
+                extended.append(landmarks[tip][1] < landmarks[mcp][1])
+        
+        return extended
+    
+    def recognize_gesture(self, landmarks):
+        """Recognize hand gestures based on landmark positions"""
+        extended = self.fingers_extended(landmarks)
+        
+        # Thumb and index extended (L shape) - Volume control
+        if extended[0] and extended[1] and not any(extended[2:]):
+            thumb_tip = landmarks[4][:2]
+            index_tip = landmarks[8][:2]
+            distance = self.calculate_distance(thumb_tip, index_tip)
+            
+            if distance > 0.1:  # Adjust threshold as needed
+                return "volume_control"
+        
+        # All fingers extended - Brightness control
+        if all(extended):
+            return "brightness_control"
+        
+        # Fist - Click
+        if not any(extended):
+            return "fist"
+        
+        # Pointing - Cursor control
+        if extended[1] and not any([extended[0]] + extended[2:]):
+            return "pointing"
+        
+        # Peace sign - Screenshot
+        if extended[1] and extended[2] and not any([extended[0]] + extended[3:]):
+            return "peace"
+            
+        return "unknown"
+    
+    def execute_control(self, gesture, landmarks, frame_center):
+        """Execute PC control based on gesture"""
+        current_time = time.time()
+        
+        if gesture == "volume_control":
+            if current_time - self.last_volume_time > self.volume_cooldown:
+                thumb_tip = landmarks[4][:2]
+                index_tip = landmarks[8][:2]
+                hand_center_x = (thumb_tip[0] + index_tip[0]) / 2
+                
+                # Control volume based on hand position relative to screen center
+                if hand_center_x < frame_center[0]:
+                    pyautogui.press('volumedown')
+                    print("Volume Down")
+                else:
+                    pyautogui.press('volumeup')
+                    print("Volume Up")
+                
+                self.last_volume_time = current_time
+        
+        elif gesture == "brightness_control":
+            if current_time - self.last_brightness_time > self.brightness_cooldown:
+                try:
+                    current_brightness = sbc.get_brightness()[0]
+                    hand_center_x = np.mean([lm[0] for lm in landmarks[:5]])  # Use wrist and first few points
+                    
+                    if hand_center_x < frame_center[0]:
+                        new_brightness = max(0, current_brightness - 10)
+                    else:
+                        new_brightness = min(100, current_brightness + 10)
+                    
+                    sbc.set_brightness(new_brightness)
+                    print(f"Brightness: {new_brightness}%")
+                    self.last_brightness_time = current_time
+                except Exception as e:
+                    print(f"Brightness control error: {e}")
+        
+        elif gesture == "fist":
+            # Mouse click
+            pyautogui.click()
+            print("Mouse Click")
+            time.sleep(0.5)  # Prevent multiple clicks
+        
+        elif gesture == "peace":
+            # Take screenshot
+            pyautogui.screenshot('screenshot.png')
+            print("Screenshot taken")
+            time.sleep(1)  # Cooldown
+
+
 # ----------------------------- Core Tracking Class -----------------------------
 class AdvancedTracker:
     def __init__(self, source=0, cam_width=1280, cam_height=720, realtime_freq=30):
@@ -122,12 +237,24 @@ class AdvancedTracker:
         # Bounding box Kalman
         self.box_kalman = Kalman2D()
 
-        # Gesture classifier
+        # Gesture classifier and recognizer
         self.gesture_clf = None
+        self.gesture_recognizer = GestureRecognizer()
 
         # For dataset capture
         self.capture_dir = "gesture_dataset"
         os.makedirs(self.capture_dir, exist_ok=True)
+        
+        # Colors for better visibility
+        self.colors = {
+            'hand_landmarks': (255, 0, 0),      # Blue
+            'hand_connections': (0, 255, 255),  # Yellow
+            'hand_box': (0, 255, 0),           # Green
+            'face_mesh': (0, 0, 255),          # Red
+            'face_landmarks': (255, 255, 0),   # Cyan
+            'text': (255, 255, 255),           # White
+            'gesture_text': (0, 255, 255)      # Yellow
+        }
 
     # --------------------------- Helpers ---------------------------------
     def _landmarks_to_np(self, lm_list, shape):
@@ -246,6 +373,11 @@ class AdvancedTracker:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         
         print(f"Camera opened successfully. Press 'q' or ESC to quit.")
+        print("Gestures:")
+        print("  - Thumb + Index extended: Volume control (left=down, right=up)")
+        print("  - All fingers extended: Brightness control")
+        print("  - Fist: Mouse click")
+        print("  - Peace sign: Screenshot")
 
         out = None
         if save_output:
@@ -268,6 +400,10 @@ class AdvancedTracker:
             results_face = self.face_mesh.process(image_rgb)
 
             image = frame.copy()
+            frame_center = (self.width // 2, self.height // 2)
+
+            # Draw center line
+            cv2.line(image, (frame_center[0], 0), (frame_center[0], self.height), (100, 100, 100), 1)
 
             if hasattr(results_face, 'multi_face_landmarks') and results_face.multi_face_landmarks:  # type: ignore
                 face_landmarks = results_face.multi_face_landmarks[0].landmark  # type: ignore
@@ -275,43 +411,64 @@ class AdvancedTracker:
                 if ok:
                     pitch, yaw, roll = euler
                     cv2.putText(image, f"Head pose P:{pitch:.0f} Y:{yaw:.0f} R:{roll:.0f}",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['text'], 2)
                 h, w = image.shape[:2]
                 for start_idx, end_idx in mp_face_mesh.FACEMESH_TESSELATION:  # type: ignore
                     s = face_landmarks[start_idx]
                     e = face_landmarks[end_idx]
                     x1, y1 = int(s.x * w), int(s.y * h)
                     x2, y2 = int(e.x * w), int(e.y * h)
-                    cv2.line(image, (x1, y1), (x2, y2), (80, 110, 10), 1)
+                    cv2.line(image, (x1, y1), (x2, y2), self.colors['face_mesh'], 1)
                 for lm in face_landmarks:
                     x, y = int(lm.x * w), int(lm.y * h)
-                    cv2.circle(image, (x, y), 1, (0, 255, 0), -1)
+                    cv2.circle(image, (x, y), 1, self.colors['face_landmarks'], -1)
 
             if hasattr(results_hands, 'multi_hand_landmarks') and results_hands.multi_hand_landmarks:  # type: ignore
                 for hand_idx, hand_landmarks in enumerate(results_hands.multi_hand_landmarks):  # type: ignore
                     lm_np = self._landmarks_to_np(hand_landmarks.landmark, image.shape[:2])
                     sm = self._smooth_hand_landmarks(hand_idx, lm_np)
 
+                    # Draw hand landmarks with new colors
                     for (x, y, z) in sm:
-                        cv2.circle(image, (int(x), int(y)), 2, (0, 200, 255), -1)
+                        cv2.circle(image, (int(x), int(y)), 4, self.colors['hand_landmarks'], -1)
+
+                    # Draw hand connections
+                    for connection in mp_hands.HAND_CONNECTIONS:
+                        start_idx, end_idx = connection
+                        x1, y1 = int(sm[start_idx][0]), int(sm[start_idx][1])
+                        x2, y2 = int(sm[end_idx][0]), int(sm[end_idx][1])
+                        cv2.line(image, (x1, y1), (x2, y2), self.colors['hand_connections'], 2)
 
                     x_min, y_min = int(np.min(sm[:, 0])), int(np.min(sm[:, 1]))
                     x_max, y_max = int(np.max(sm[:, 0])), int(np.max(sm[:, 1]))
                     cx, cy = (x_min + x_max) // 2, (y_min + y_max) // 2
                     self.box_kalman.correct(cx, cy)
-                    cv2.rectangle(image, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
+                    cv2.rectangle(image, (x_min, y_min), (x_max, y_max), self.colors['hand_box'], 2)
+
+                    # Gesture recognition and control
+                    gesture = self.gesture_recognizer.recognize_gesture(sm)
+                    
+                    # Display gesture
+                    cv2.putText(image, f"Gesture: {gesture}",
+                                (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 
+                                self.colors['gesture_text'], 2)
+                    
+                    # Execute PC control
+                    if gesture != "unknown":
+                        self.gesture_recognizer.execute_control(gesture, sm, frame_center)
 
                     flat = sm[:, :2].flatten()
                     if capture_label is not None:
                         self.capture_gesture_frame(flat, capture_label)
                         cv2.putText(image, f"Capturing: {capture_label}",
-                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['gesture_text'], 2)
 
                     if self.gesture_clf is not None:
                         try:
                             pred = self.gesture_clf.predict([flat])[0]
-                            cv2.putText(image, f"Gesture: {pred}",
-                                        (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                            cv2.putText(image, f"ML Gesture: {pred}",
+                                        (x_min, y_min - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 
+                                        self.colors['gesture_text'], 2)
                         except Exception as e:
                             print("Gesture prediction error:", e)
 
@@ -319,7 +476,7 @@ class AdvancedTracker:
             fps = 1.0 / (curr_time - prev_time) if prev_time else 0.0
             prev_time = curr_time
             cv2.putText(image, f"FPS: {int(fps)}", 
-                       (self.width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                       (self.width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['text'], 2)
 
             cv2.imshow('AdvancedTracker', image)
             if out is not None and out.isOpened():
